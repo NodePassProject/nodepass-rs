@@ -402,6 +402,19 @@ impl Common {
 
     pub fn init_cancel(&mut self) {
         self.cancel = CancellationToken::new();
+
+        // Recreate channels for the new start() cycle so .take() won't return None
+        let (signal_tx, signal_rx) = mpsc::channel(SEMAPHORE_LIMIT());
+        self.signal_tx = signal_tx;
+        self.signal_rx = Some(signal_rx);
+
+        let (write_tx, write_rx) = mpsc::channel(SEMAPHORE_LIMIT());
+        self.write_tx = write_tx;
+        self.write_rx = Some(write_rx);
+
+        let (verify_tx, verify_rx) = mpsc::channel(1);
+        self.verify_tx = verify_tx;
+        self.verify_rx = Some(verify_rx);
     }
 
     pub fn generate_auth_token(&self) -> String {
@@ -583,6 +596,7 @@ impl Common {
                 pool.close().await;
             });
         }
+        self.tunnel_pool = None;
 
         self.target_udp_sessions.clear();
 

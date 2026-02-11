@@ -66,7 +66,7 @@ async fn start(args: Vec<String>) -> anyhow::Result<()> {
     match parsed_url.scheme() {
         "server" => {
             let (tls_code, tls_config) = get_tls_protocol(&parsed_url, &logger);
-            let mut srv = server::Server::new(parsed_url, tls_code, tls_config, logger)?;
+            let srv = server::Server::new(parsed_url, tls_code, tls_config, logger)?;
             srv.run().await;
         }
         "client" => {

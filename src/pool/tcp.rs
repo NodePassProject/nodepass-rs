@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::conn::PoolConn;
@@ -16,6 +16,7 @@ pub struct TcpServerPool {
     client_ip: String,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<Mutex<Option<TcpListener>>>,
+    conn_rx: Arc<Mutex<Option<mpsc::Receiver<PoolConn>>>>,
     incoming: Arc<Mutex<HashMap<String, PoolConn>>>,
     incoming_queue: Arc<Mutex<Vec<(String, PoolConn)>>>,
     incoming_notify: Arc<Notify>,
@@ -40,6 +41,31 @@ impl TcpServerPool {
             client_ip,
             tls_acceptor,
             listener: Arc::new(Mutex::new(Some(listener))),
+            conn_rx: Arc::new(Mutex::new(None)),
+            incoming: Arc::new(Mutex::new(HashMap::new())),
+            incoming_queue: Arc::new(Mutex::new(Vec::new())),
+            incoming_notify: Arc::new(Notify::new()),
+            ready: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicUsize::new(0)),
+            errors: Arc::new(AtomicUsize::new(0)),
+            report_interval,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create a channel-fed pool that receives pre-accepted connections from an external channel.
+    /// TLS is already handled by the central accept loop, so no TLS acceptor or listener needed.
+    pub fn new_channel_fed(
+        max_capacity: usize,
+        conn_rx: mpsc::Receiver<PoolConn>,
+        report_interval: Duration,
+    ) -> Self {
+        Self {
+            max_capacity,
+            client_ip: String::new(),
+            tls_acceptor: None,
+            listener: Arc::new(Mutex::new(None)),
+            conn_rx: Arc::new(Mutex::new(Some(conn_rx))),
             incoming: Arc::new(Mutex::new(HashMap::new())),
             incoming_queue: Arc::new(Mutex::new(Vec::new())),
             incoming_notify: Arc::new(Notify::new()),
@@ -108,6 +134,40 @@ impl TcpServerPool {
                     self.active.fetch_add(1, Ordering::SeqCst);
                     self.incoming_notify.notify_one();
                 }
+            }
+        }
+    }
+
+    /// Receive connections from an external channel and add them to the pool.
+    /// Used in multi-client mode where the central accept loop routes connections.
+    pub async fn channel_fed_manager(&self) {
+        let conn_rx = {
+            let mut guard = self.conn_rx.lock().await;
+            guard.take()
+        };
+        let Some(mut conn_rx) = conn_rx else { return };
+
+        self.ready.store(true, Ordering::SeqCst);
+        let mut id_counter = 0u64;
+
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match conn_rx.recv().await {
+                Some(conn) => {
+                    let id = format!("{:08x}", id_counter);
+                    id_counter += 1;
+
+                    let mut queue = self.incoming_queue.lock().await;
+                    if queue.len() < self.max_capacity {
+                        queue.push((id, conn));
+                        self.active.fetch_add(1, Ordering::SeqCst);
+                        self.incoming_notify.notify_one();
+                    }
+                }
+                None => break,
             }
         }
     }
