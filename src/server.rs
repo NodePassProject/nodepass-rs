@@ -1,5 +1,7 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +14,21 @@ use crate::pool::TransportPool;
 use crate::signal_protocol::Signal;
 use crate::tls;
 use crate::{log_debug, log_error, log_event, log_info};
+
+fn bind_reuse_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    let socket = Socket::new(
+        if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 },
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(TcpListener::from_std(socket.into())?)
+}
 
 pub struct Server {
     pub common: Common,
@@ -104,7 +121,7 @@ impl Server {
         // Init tunnel listener
         let tunnel_addr = self.common.tunnel_tcp_addr
             .ok_or_else(|| anyhow::anyhow!("start: nil tunnel address"))?;
-        let tunnel_listener = TcpListener::bind(tunnel_addr).await
+        let tunnel_listener = bind_reuse_listener(tunnel_addr)
             .map_err(|e| anyhow::anyhow!("start: initTunnelListener failed: {}", e))?;
 
         // Determine run mode
@@ -137,14 +154,10 @@ impl Server {
         self.common.handshake_start = Instant::now();
 
         // Tunnel handshake - serve temp HTTPS to exchange config
-        self.tunnel_handshake(tunnel_listener).await?;
+        let pool_listener = self.tunnel_handshake(tunnel_listener, tunnel_addr).await?;
 
-        // Rebind tunnel listener after handshake
-        let tunnel_listener = TcpListener::bind(tunnel_addr).await
-            .map_err(|e| anyhow::anyhow!("start: rebind tunnel listener failed: {}", e))?;
-
-        // Init tunnel pool
-        self.init_tunnel_pool(tunnel_listener).await?;
+        // Init tunnel pool (listener was pre-created before handshake response)
+        self.init_tunnel_pool(pool_listener).await?;
 
         log_info!(self.common.logger, "Getting tunnel pool ready...");
 
@@ -161,7 +174,7 @@ impl Server {
         self.common_control().await
     }
 
-    async fn tunnel_handshake(&mut self, listener: TcpListener) -> anyhow::Result<()> {
+    async fn tunnel_handshake(&mut self, listener: TcpListener, tunnel_addr: SocketAddr) -> anyhow::Result<TcpListener> {
         let tls_config = self.common.tls_config.clone()
             .or_else(|| tls::new_tls_config().ok());
         let tls_config = tls_config.ok_or_else(|| anyhow::anyhow!("tunnelHandshake: no TLS config"))?;
@@ -246,6 +259,12 @@ impl Server {
                         body_str.len(),
                         body_str
                     );
+                    // Bind pool listener BEFORE sending response to avoid race condition.
+                    // The client will start connecting pool connections immediately after
+                    // receiving the handshake response, so the port must already be listening.
+                    let pool_listener = bind_reuse_listener(tunnel_addr)
+                        .map_err(|e| anyhow::anyhow!("tunnelHandshake: bind pool listener failed: {}", e))?;
+
                     buf_reader.get_mut().write_all(response.as_bytes()).await.ok();
 
                     let client_ip = addr.ip().to_string();
@@ -261,7 +280,7 @@ impl Server {
                         }
                     }
 
-                    return Ok(());
+                    return Ok(pool_listener);
                 }
             }
         }
@@ -533,7 +552,6 @@ impl Server {
     }
 }
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpStream;
 

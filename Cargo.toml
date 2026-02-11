@@ -45,6 +45,7 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 time = "0.3"
 urlencoding = "2"
+socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]
 strip = true
