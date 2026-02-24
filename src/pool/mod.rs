@@ -42,4 +42,10 @@ pub trait TransportPool: Send + Sync {
 
     /// Reset error count
     fn reset_error(&self);
+
+    /// Get the TLS peer certificate fingerprint for a connection by ID.
+    /// Only meaningful for client pools where peer certs are captured during TLS handshake.
+    fn fingerprint_for(&self, _id: &str) -> Option<String> {
+        None
+    }
 }

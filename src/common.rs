@@ -1,5 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +22,7 @@ pub struct Common {
     pub dns_cache: DnsCache,
     pub tls_code: String,
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
+    pub cert_der: Option<Vec<u8>>,
     pub core_type: String,
     pub run_mode: String,
     pub pool_type: String,
@@ -32,7 +31,7 @@ pub struct Common {
     pub server_port: String,
     pub client_ip: String,
     pub dialer_ip: String,
-    pub dialer_fallback: AtomicU32,
+    pub dialer_fallback: Arc<AtomicU32>,
     pub tunnel_key: String,
     pub tunnel_addr: String,
     pub tunnel_tcp_addr: Option<SocketAddr>,
@@ -88,6 +87,7 @@ impl Common {
             dns_cache: DnsCache::new(DEFAULT_DNS_TTL),
             tls_code: "0".to_string(),
             tls_config: None,
+            cert_der: None,
             core_type: String::new(),
             run_mode: String::new(),
             pool_type: String::new(),
@@ -96,7 +96,7 @@ impl Common {
             server_port: String::new(),
             client_ip: String::new(),
             dialer_ip: DEFAULT_DIALER_IP.to_string(),
-            dialer_fallback: AtomicU32::new(0),
+            dialer_fallback: Arc::new(AtomicU32::new(0)),
             tunnel_key: String::new(),
             tunnel_addr: String::new(),
             tunnel_tcp_addr: None,
@@ -244,23 +244,23 @@ impl Common {
     }
 
     fn get_tunnel_key(&mut self) {
-        if let Some(password) = self.parsed_url.password() {
-            self.tunnel_key = password.to_string();
-        } else if let Ok(username) = urlencoding::decode(self.parsed_url.username()) {
-            if !username.is_empty() {
-                self.tunnel_key = username.to_string();
-            } else {
-                self.tunnel_key = self.generate_fnv_key();
-            }
+        let raw_username = self.parsed_url.username();
+        if !raw_username.is_empty() {
+            self.tunnel_key = urlencoding::decode(raw_username)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| raw_username.to_string());
         } else {
             self.tunnel_key = self.generate_fnv_key();
         }
     }
 
     fn generate_fnv_key(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.server_port.hash(&mut hasher);
-        let hash = hasher.finish() as u32;
+        // FNV-1a 32-bit hash to match Go's fnv.New32a()
+        let mut hash: u32 = 2166136261;
+        for &byte in self.server_port.as_bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(16777619);
+        }
         hex::encode(hash.to_be_bytes())
     }
 
@@ -389,6 +389,7 @@ impl Common {
         self.parsed_url.query_pairs()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.to_string())
+            .filter(|v| !v.is_empty())
     }
 
     pub fn init_rate_limiter(&mut self) {
@@ -476,16 +477,15 @@ impl Common {
             anyhow::bail!("dialWithRotation: no target addresses");
         }
 
-        let get_addr = |idx: usize| -> SocketAddr {
-            self.target_tcp_addrs[idx]
-        };
-
         if addr_count == 1 {
-            let addr = get_addr(0);
-            return tokio::time::timeout(timeout, TcpStream::connect(addr))
-                .await
-                .map_err(|_| anyhow::anyhow!("dialWithRotation: timeout"))?
-                .map_err(|e| anyhow::anyhow!("dialWithRotation: connect failed: {}", e));
+            let addr = crate::dns_cache::resolve_addr(&self.dns_cache, &self.target_addrs[0]).await?;
+            return tokio::time::timeout(
+                timeout,
+                connect_tcp_bound(addr, &self.dialer_ip, &self.dialer_fallback, &self.logger),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("dialWithRotation: timeout"))?
+            .map_err(|e| anyhow::anyhow!("dialWithRotation: connect failed: {}", e));
         }
 
         let start_idx = match self.lb_strategy.as_str() {
@@ -508,9 +508,20 @@ impl Common {
         let mut last_err = None;
         for i in 0..addr_count {
             let target_idx = (start_idx + i) % addr_count;
-            let addr = get_addr(target_idx);
+            let addr = match crate::dns_cache::resolve_addr(&self.dns_cache, &self.target_addrs[target_idx]).await {
+                Ok(a) => a,
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
 
-            match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            match tokio::time::timeout(
+                timeout,
+                connect_tcp_bound(addr, &self.dialer_ip, &self.dialer_fallback, &self.logger),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => {
                     if i > 0 && (self.lb_strategy == "1" || self.lb_strategy == "2") {
                         self.target_idx.store(target_idx as u64, Ordering::SeqCst);
@@ -592,5 +603,47 @@ impl Common {
 
         self.dns_cache.clear();
     }
+}
+
+/// Connect to a TCP address, optionally binding to a specific local IP.
+/// If binding fails, atomically falls back to system-auto for all future connections.
+pub async fn connect_tcp_bound(
+    addr: SocketAddr,
+    dialer_ip: &str,
+    dialer_fallback: &AtomicU32,
+    logger: &Logger,
+) -> std::io::Result<TcpStream> {
+    use tokio::net::TcpSocket;
+
+    let should_bind = dialer_ip != DEFAULT_DIALER_IP && dialer_fallback.load(Ordering::SeqCst) == 0;
+
+    if should_bind {
+        if let Ok(local_ip) = dialer_ip.parse::<std::net::IpAddr>() {
+            let socket = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+
+            if let Err(e) = socket.bind(SocketAddr::new(local_ip, 0)) {
+                if dialer_fallback.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    log_error!(logger, "dialWithRotation: fallback to system auto due to dialer failure: {}", e);
+                }
+                return TcpStream::connect(addr).await;
+            }
+
+            match socket.connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    if dialer_fallback.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        log_error!(logger, "dialWithRotation: fallback to system auto due to dialer failure: {}", e);
+                    }
+                    return TcpStream::connect(addr).await;
+                }
+            }
+        }
+    }
+
+    TcpStream::connect(addr).await
 }
 

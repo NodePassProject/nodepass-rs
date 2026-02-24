@@ -219,6 +219,8 @@ pub struct TcpClientPool {
     active: Arc<AtomicUsize>,
     errors: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
+    /// Stores TLS peer certificate fingerprints by connection ID (for verification)
+    fingerprints: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl TcpClientPool {
@@ -255,6 +257,7 @@ impl TcpClientPool {
             active: Arc::new(AtomicUsize::new(0)),
             errors: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            fingerprints: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -284,20 +287,29 @@ impl TcpClientPool {
                 };
 
                 // Apply TLS if needed
-                let conn: PoolConn = if self.tls_code != "0" {
+                let (conn, peer_fp): (PoolConn, Option<String>) = if self.tls_code != "0" {
                     let tls_config = tls::insecure_client_config();
                     let connector = TlsConnector::from(tls_config);
                     let server_name = rustls::pki_types::ServerName::try_from(self.server_name.clone())
                         .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
                     match connector.connect(server_name, stream).await {
-                        Ok(tls_stream) => Box::pin(tls_stream),
+                        Ok(tls_stream) => {
+                            // Extract peer certificate fingerprint before boxing
+                            let fp = {
+                                let (_, conn) = tls_stream.get_ref();
+                                conn.peer_certificates()
+                                    .and_then(|certs| certs.first())
+                                    .map(|cert| tls::format_cert_fingerprint(cert.as_ref()))
+                            };
+                            (Box::pin(tls_stream), fp)
+                        }
                         Err(_) => {
                             tokio::time::sleep(current_interval).await;
                             continue;
                         }
                     }
                 } else {
-                    Box::pin(stream)
+                    (Box::pin(stream), None)
                 };
 
                 let id = format!("{:08x}", id_counter);
@@ -307,9 +319,15 @@ impl TcpClientPool {
                     let mut conns = self.connections.lock().await;
                     let mut ids = self.conn_ids.lock().await;
                     conns.insert(id.clone(), conn);
-                    ids.push(id);
+                    ids.push(id.clone());
                     self.active.fetch_add(1, Ordering::SeqCst);
                     self.conn_notify.notify_one();
+                }
+
+                // Store fingerprint if available
+                if let Some(fp) = peer_fp {
+                    let mut fps = self.fingerprints.lock().await;
+                    fps.insert(id, fp);
                 }
 
                 if !self.ready.load(Ordering::SeqCst) {
@@ -380,9 +398,10 @@ impl TransportPool for TcpClientPool {
     async fn flush(&self) {
         let mut conns = self.connections.lock().await;
         let mut ids = self.conn_ids.lock().await;
-        let _count = conns.len();
+        let mut fps = self.fingerprints.lock().await;
         conns.clear();
         ids.clear();
+        fps.clear();
         self.active.store(0, Ordering::SeqCst);
     }
 
@@ -417,5 +436,10 @@ impl TransportPool for TcpClientPool {
 
     fn reset_error(&self) {
         self.errors.store(0, Ordering::SeqCst);
+    }
+
+    fn fingerprint_for(&self, id: &str) -> Option<String> {
+        // Use try_lock to avoid async; fingerprint reads are quick
+        self.fingerprints.try_lock().ok()?.get(id).cloned()
     }
 }

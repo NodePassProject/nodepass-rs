@@ -65,8 +65,8 @@ async fn start(args: Vec<String>) -> anyhow::Result<()> {
 
     match parsed_url.scheme() {
         "server" => {
-            let (tls_code, tls_config) = get_tls_protocol(&parsed_url, &logger);
-            let mut srv = server::Server::new(parsed_url, tls_code, tls_config, logger)?;
+            let (tls_code, tls_config, cert_der) = get_tls_protocol(&parsed_url, &logger);
+            let mut srv = server::Server::new(parsed_url, tls_code, tls_config, cert_der, logger)?;
             srv.run().await;
         }
         "client" => {
@@ -74,7 +74,7 @@ async fn start(args: Vec<String>) -> anyhow::Result<()> {
             cli.run().await;
         }
         "master" => {
-            let (tls_code, tls_config) = get_tls_protocol(&parsed_url, &logger);
+            let (tls_code, tls_config, _cert_der) = get_tls_protocol(&parsed_url, &logger);
             let mut mst = master::Master::new(parsed_url, tls_code, tls_config, logger, VERSION.to_string())?;
             mst.run().await;
         }
@@ -111,13 +111,13 @@ fn init_logger(level: Option<&str>) -> Logger {
     logger
 }
 
-fn get_tls_protocol(parsed_url: &url::Url, logger: &Logger) -> (String, Option<Arc<rustls::ServerConfig>>) {
-    let tls_config = match tls::new_tls_config() {
-        Ok(config) => config,
+fn get_tls_protocol(parsed_url: &url::Url, logger: &Logger) -> (String, Option<Arc<rustls::ServerConfig>>, Option<Vec<u8>>) {
+    let (tls_config, cert_der) = match tls::new_tls_config() {
+        Ok((config, der)) => (config, der),
         Err(e) => {
             log_error!(logger, "Generate TLS config failed: {}", e);
             log_warn!(logger, "TLS code-0: nil cert");
-            return ("0".to_string(), None);
+            return ("0".to_string(), None, None);
         }
     };
 
@@ -129,7 +129,7 @@ fn get_tls_protocol(parsed_url: &url::Url, logger: &Logger) -> (String, Option<A
     match tls_param.as_deref() {
         Some("1") => {
             log_info!(logger, "TLS code-1: RAM cert with TLS 1.3");
-            ("1".to_string(), Some(tls_config))
+            ("1".to_string(), Some(tls_config), Some(cert_der))
         }
         Some("2") => {
             let crt_file = parsed_url
@@ -143,15 +143,15 @@ fn get_tls_protocol(parsed_url: &url::Url, logger: &Logger) -> (String, Option<A
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
 
-            match tls::load_tls_config(&crt_file, &key_file) {
+            match tls::load_tls_config_reloading(&crt_file, &key_file) {
                 Ok(config) => {
                     log_info!(logger, "TLS code-2: file cert with TLS 1.3");
-                    ("2".to_string(), Some(config))
+                    ("2".to_string(), Some(config), None)
                 }
                 Err(e) => {
                     log_error!(logger, "Certificate load failed: {}", e);
                     log_warn!(logger, "TLS code-1: RAM cert with TLS 1.3");
-                    ("1".to_string(), Some(tls_config))
+                    ("1".to_string(), Some(tls_config), Some(cert_der))
                 }
             }
         }
@@ -164,10 +164,10 @@ fn get_tls_protocol(parsed_url: &url::Url, logger: &Logger) -> (String, Option<A
 
             if pool_type.as_deref() == Some("1") || pool_type.as_deref() == Some("3") {
                 log_info!(logger, "TLS code-1: RAM cert with TLS 1.3 for stream pool");
-                ("1".to_string(), Some(tls_config))
+                ("1".to_string(), Some(tls_config), Some(cert_der))
             } else {
                 log_warn!(logger, "TLS code-0: unencrypted");
-                ("0".to_string(), None)
+                ("0".to_string(), None, None)
             }
         }
     }

@@ -21,7 +21,6 @@ pub fn parse_go_duration_pub(s: &str) -> Option<Duration> {
 }
 
 fn parse_go_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
     if s.is_empty() {
         return None;
     }

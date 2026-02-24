@@ -10,8 +10,11 @@ use crate::config::*;
 use crate::conn::exchange::data_exchange;
 use crate::logger::Logger;
 use crate::pool::tcp::TcpClientPool;
+use crate::pool::quic::QuicClientPool;
+use crate::pool::websocket::WsClientPool;
+use crate::pool::http2::H2ClientPool;
 use crate::signal_protocol::Signal;
-use crate::{log_debug, log_error, log_event, log_info};
+use crate::{log_debug, log_error, log_event, log_info, log_warn};
 
 pub struct Client {
     pub common: Common,
@@ -183,16 +186,39 @@ impl Client {
                     let _rate_limiter = rate_limiter.clone();
                     let read_timeout = read_timeout;
 
+                    let dialer_ip = self.common.dialer_ip.clone();
+                    let dialer_fallback = self.common.dialer_fallback.clone();
+                    let proxy_protocol = self.common.proxy_protocol.clone();
+                    let block_socks = self.common.block_socks;
+                    let block_http = self.common.block_http;
+                    let block_tls = self.common.block_tls;
+
                     tokio::spawn(async move {
+                        // Protocol blocking check
+                        if block_socks || block_http || block_tls {
+                            let mut peek_buf = [0u8; 8];
+                            match tunnel_conn.peek(&mut peek_buf).await {
+                                Ok(n) if n > 0 => {
+                                    if let Some(protocol) = crate::block::detect_block_protocol(
+                                        &peek_buf[..n], block_socks, block_http, block_tls,
+                                    ) {
+                                        log_warn!(logger, "singleTCPLoop: blocked {} protocol from {}", protocol, addr);
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
                         // Dial target
                         let target_addr = match target_addrs.first() {
                             Some(a) => *a,
                             None => return,
                         };
 
-                        let target_conn = match tokio::time::timeout(
+                        let mut target_conn = match tokio::time::timeout(
                             TCP_DIAL_TIMEOUT(),
-                            TcpStream::connect(target_addr),
+                            crate::common::connect_tcp_bound(target_addr, &dialer_ip, &dialer_fallback, &logger),
                         ).await {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
@@ -204,6 +230,20 @@ impl Client {
                                 return;
                             }
                         };
+
+                        // Send PROXY v1 header if needed
+                        if proxy_protocol == "1" {
+                            if let Ok(remote_addr) = target_conn.peer_addr() {
+                                if let Err(e) = crate::proxy::send_proxy_v1_header(
+                                    &addr.to_string(),
+                                    remote_addr,
+                                    &mut target_conn,
+                                ).await {
+                                    log_error!(logger, "singleTCPLoop: sendProxyV1Header failed: {}", e);
+                                    return;
+                                }
+                            }
+                        }
 
                         let buf_size = TCP_DATA_BUF_SIZE();
                         let mut buf1 = vec![0u8; buf_size];
@@ -291,8 +331,10 @@ impl Client {
         let server_name = self.common.server_name.clone();
 
         match self.common.pool_type.as_str() {
-            "0" => {
-                let pool = Arc::new(TcpClientPool::new(
+            "1" => {
+                // QUIC
+                let tunnel_addr_clone = tunnel_addr.clone();
+                let pool = Arc::new(QuicClientPool::new(
                     self.common.min_pool_capacity,
                     self.common.max_pool_capacity,
                     MIN_POOL_INTERVAL(),
@@ -301,11 +343,47 @@ impl Client {
                     tls_code,
                     server_name,
                     move || {
-                        let addr = tunnel_addr.clone();
-                        async move {
-                            TcpStream::connect(&addr).await
-                                .map_err(|e| anyhow::anyhow!("{}", e))
-                        }
+                        let addr = tunnel_addr_clone.clone();
+                        async move { Ok(addr) }
+                    },
+                ));
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    pool_clone.client_manager().await;
+                });
+                self.common.tunnel_pool = Some(pool);
+            }
+            "2" => {
+                // WebSocket
+                let pool = Arc::new(WsClientPool::new(
+                    self.common.min_pool_capacity,
+                    self.common.max_pool_capacity,
+                    MIN_POOL_INTERVAL(),
+                    MAX_POOL_INTERVAL(),
+                    REPORT_INTERVAL(),
+                    tls_code,
+                    tunnel_addr,
+                ));
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    pool_clone.client_manager().await;
+                });
+                self.common.tunnel_pool = Some(pool);
+            }
+            "3" => {
+                // HTTP/2
+                let tunnel_addr_clone = tunnel_addr.clone();
+                let pool = Arc::new(H2ClientPool::new(
+                    self.common.min_pool_capacity,
+                    self.common.max_pool_capacity,
+                    MIN_POOL_INTERVAL(),
+                    MAX_POOL_INTERVAL(),
+                    REPORT_INTERVAL(),
+                    tls_code,
+                    server_name,
+                    move || {
+                        let addr = tunnel_addr_clone.clone();
+                        async move { Ok(addr) }
                     },
                 ));
                 let pool_clone = pool.clone();
@@ -315,6 +393,7 @@ impl Client {
                 self.common.tunnel_pool = Some(pool);
             }
             _ => {
+                // Default: TCP
                 let pool = Arc::new(TcpClientPool::new(
                     self.common.min_pool_capacity,
                     self.common.max_pool_capacity,
@@ -434,6 +513,10 @@ impl Client {
             }
         });
 
+        if self.common.tls_code == "1" {
+            log_info!(self.common.logger, "TLS code-1: RAM cert fingerprint verifying...");
+        }
+
         Ok(())
     }
 
@@ -446,6 +529,54 @@ impl Client {
         let pool = self.common.tunnel_pool.clone()
             .ok_or_else(|| anyhow::anyhow!("commonControl: no pool"))?;
         let write_tx = self.common.write_tx.clone();
+
+        // Incoming verify task - client sends peer cert fingerprint to server
+        if self.common.tls_code == "1" {
+            let verify_cancel = cancel.clone();
+            let verify_pool = pool.clone();
+            let verify_write_tx = write_tx.clone();
+            let verify_key = self.common.tunnel_key.clone();
+            let verify_logger = logger.clone();
+
+            tokio::spawn(async move {
+                // Wait one report interval before verifying (matches Go behavior)
+                tokio::select! {
+                    _ = verify_cancel.cancelled() => return,
+                    _ = tokio::time::sleep(REPORT_INTERVAL()) => {},
+                }
+
+                // Wait for pool to be ready with connections
+                loop {
+                    if verify_cancel.is_cancelled() { return; }
+                    if verify_pool.ready() && verify_pool.active() > 0 { break; }
+                    tokio::time::sleep(CONTEXT_CHECK_INTERVAL).await;
+                }
+
+                // Get a test connection from the pool
+                let (id, test_conn) = match verify_pool.incoming_get(POOL_GET_TIMEOUT()).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log_error!(verify_logger, "incomingVerify: incomingGet failed: {}", e);
+                        verify_cancel.cancel();
+                        return;
+                    }
+                };
+
+                // Get peer cert fingerprint from pool (stored during TLS handshake)
+                let fingerprint = verify_pool.fingerprint_for(&id).unwrap_or_default();
+
+                drop(test_conn); // Close the test connection
+
+                // Send verify signal to server
+                let signal = Signal::verify(&id, &fingerprint);
+                if let Ok(data) = serde_json::to_vec(&signal) {
+                    let encoded = crate::signal_protocol::encode_signal(&data, verify_key.as_bytes());
+                    let _ = verify_write_tx.send(encoded).await;
+                }
+
+                log_debug!(verify_logger, "TLS code-1: verify signal: cid {} -> control", id);
+            });
+        }
 
         // Health check
         let health_cancel = cancel.clone();
@@ -479,6 +610,21 @@ impl Client {
             }
         });
 
+        // Wait for TLS verification before starting data loops (if tls_code == "1")
+        if self.common.tls_code == "1" {
+            let mut verify_rx = self.common.verify_rx.take();
+            if let Some(ref mut rx) = verify_rx {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        anyhow::bail!("commonControl: context error during verify wait");
+                    }
+                    _ = rx.recv() => {
+                        // Verification complete
+                    }
+                }
+            }
+        }
+
         // Signal dispatch
         loop {
             tokio::select! {
@@ -498,11 +644,18 @@ impl Client {
                                 let rate_limiter = self.common.rate_limiter.clone();
                                 let read_timeout = self.common.read_timeout;
                                 let proxy_protocol = self.common.proxy_protocol.clone();
+                                let dialer_ip = self.common.dialer_ip.clone();
+                                let dialer_fallback = self.common.dialer_fallback.clone();
+                                let block_socks = self.common.block_socks;
+                                let block_http = self.common.block_http;
+                                let block_tls = self.common.block_tls;
 
                                 tokio::spawn(async move {
                                     crate::server::handle_tcp_once(
                                         signal, pool, logger, target_addrs, tcp_rx, tcp_tx,
                                         rate_limiter, read_timeout, proxy_protocol,
+                                        dialer_ip, dialer_fallback,
+                                        block_socks, block_http, block_tls,
                                     ).await.ok();
                                 });
                             }
@@ -539,6 +692,62 @@ impl Client {
                                 self.common.udp_tx.load(Ordering::SeqCst),
                             );
                             self.common.check_point = Instant::now();
+                        }
+                        "verify" => {
+                            if self.common.tls_code == "1" {
+                                let pool = pool.clone();
+                                let logger = logger.clone();
+                                let cancel = cancel.clone();
+                                let verify_tx = self.common.verify_tx.clone();
+
+                                tokio::spawn(async move {
+                                    // Wait for pool ready
+                                    loop {
+                                        if cancel.is_cancelled() { return; }
+                                        if pool.ready() { break; }
+                                        tokio::time::sleep(CONTEXT_CHECK_INTERVAL).await;
+                                    }
+
+                                    let server_fingerprint = signal.fp.clone();
+                                    if server_fingerprint.is_empty() {
+                                        log_error!(logger, "outgoingVerify: no fingerprint in signal");
+                                        cancel.cancel();
+                                        return;
+                                    }
+
+                                    let id = signal.id.clone();
+                                    log_debug!(logger, "TLS verify signal: cid {} <- control", id);
+
+                                    // Get the peer cert fingerprint stored during TLS handshake
+                                    let client_fingerprint = pool.fingerprint_for(&id).unwrap_or_default();
+
+                                    // Get the test connection (consume it)
+                                    let test_conn = match pool.outgoing_get(&id, POOL_GET_TIMEOUT()).await {
+                                        Ok(conn) => conn,
+                                        Err(e) => {
+                                            log_error!(logger, "outgoingVerify: request timeout: {}", e);
+                                            cancel.cancel();
+                                            return;
+                                        }
+                                    };
+                                    drop(test_conn);
+
+                                    if client_fingerprint.is_empty() {
+                                        log_error!(logger, "outgoingVerify: no peer certificates found");
+                                        cancel.cancel();
+                                        return;
+                                    }
+
+                                    if server_fingerprint != client_fingerprint {
+                                        log_error!(logger, "outgoingVerify: certificate fingerprint mismatch: server: {} - client: {}", server_fingerprint, client_fingerprint);
+                                        cancel.cancel();
+                                        return;
+                                    }
+
+                                    log_info!(logger, "TLS code-1: RAM cert fingerprint verified: {}", server_fingerprint);
+                                    let _ = verify_tx.send(()).await;
+                                });
+                            }
                         }
                         _ => {}
                     }

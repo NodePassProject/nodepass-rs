@@ -1,37 +1,71 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::conn::PoolConn;
 use crate::pool::TransportPool;
+use crate::tls;
 
-// WebSocket adapter that implements AsyncRead + AsyncWrite
 use futures_util::{SinkExt, StreamExt};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-struct WsStream {
-    rx_buf: Vec<u8>,
-    rx_pos: usize,
-    ws_rx: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-    ws_tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
-}
+/// Spawn background tasks to bridge a WebSocket stream to a duplex byte stream.
+/// Returns one end of the duplex as a PoolConn-compatible stream.
+fn spawn_ws_bridge<S>(ws: tokio_tungstenite::WebSocketStream<S>) -> tokio::io::DuplexStream
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (app_side, bridge_side) = tokio::io::duplex(65536);
+    let (bridge_read, bridge_write) = tokio::io::split(bridge_side);
+    let (mut ws_tx, mut ws_rx) = ws.split();
 
-// For server-side accepted WS connections (no MaybeTlsStream)
-struct WsServerStream {
-    rx_buf: Vec<u8>,
-    rx_pos: usize,
-    ws_rx: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>,
-    ws_tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, Message>,
+    // WS recv -> bridge write (data from remote appears on app_side's read)
+    tokio::spawn(async move {
+        let mut bridge_write = bridge_write;
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    if bridge_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {} // ignore text, ping, pong
+            }
+        }
+    });
+
+    // Bridge read -> WS send (data written to app_side becomes WS Binary messages)
+    tokio::spawn(async move {
+        let mut bridge_read = bridge_read;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match bridge_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    app_side
 }
 
 /// WebSocket Server Pool
 pub struct WsServerPool {
     max_capacity: usize,
+    client_ip: String,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     listener: Arc<Mutex<Option<TcpListener>>>,
     connections: Arc<Mutex<Vec<(String, PoolConn)>>>,
@@ -46,13 +80,14 @@ pub struct WsServerPool {
 impl WsServerPool {
     pub fn new(
         max_capacity: usize,
-        _client_ip: String,
+        client_ip: String,
         tls_config: Option<Arc<rustls::ServerConfig>>,
         listener: TcpListener,
         report_interval: Duration,
     ) -> Self {
         Self {
             max_capacity,
+            client_ip,
             tls_config,
             listener: Arc::new(Mutex::new(Some(listener))),
             connections: Arc::new(Mutex::new(Vec::new())),
@@ -80,7 +115,7 @@ impl WsServerPool {
                 break;
             }
 
-            let (stream, _addr) = match listener.accept().await {
+            let (stream, addr) = match listener.accept().await {
                 Ok(s) => s,
                 Err(_) => {
                     if self.shutdown.load(Ordering::SeqCst) {
@@ -91,17 +126,36 @@ impl WsServerPool {
                 }
             };
 
-            // Accept WebSocket connection
-            let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(_) => continue,
+            // Filter by client IP if specified
+            if !self.client_ip.is_empty() {
+                let peer_ip = addr.ip().to_string();
+                if peer_ip != self.client_ip {
+                    continue;
+                }
+            }
+
+            // Apply TLS if configured, then accept WebSocket
+            let conn: PoolConn = if let Some(ref tls_config) = self.tls_config {
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(tls) => tls,
+                    Err(_) => continue,
+                };
+                let ws_stream = match tokio_tungstenite::accept_async(tls_stream).await {
+                    Ok(ws) => ws,
+                    Err(_) => continue,
+                };
+                Box::pin(spawn_ws_bridge(ws_stream))
+            } else {
+                let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(_) => continue,
+                };
+                Box::pin(spawn_ws_bridge(ws_stream))
             };
 
             let id = format!("{:08x}", id_counter);
             id_counter += 1;
-
-            // Wrap WebSocket as PoolConn using a simple adapter
-            let conn: PoolConn = Box::pin(WsAdapter::new_server(ws_stream));
 
             {
                 let mut conns = self.connections.lock().await;
@@ -195,6 +249,7 @@ pub struct WsClientPool {
     active: Arc<AtomicUsize>,
     errors: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
+    fingerprints: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl WsClientPool {
@@ -221,6 +276,7 @@ impl WsClientPool {
             active: Arc::new(AtomicUsize::new(0)),
             errors: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            fingerprints: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -242,7 +298,20 @@ impl WsClientPool {
                 let scheme = if self.tls_code != "0" { "wss" } else { "ws" };
                 let url = format!("{}://{}", scheme, self.tunnel_addr);
 
-                let ws_stream = match tokio_tungstenite::connect_async(&url).await {
+                // Use custom TLS connector for insecure verification (self-signed certs)
+                let connector = if self.tls_code != "0" {
+                    Some(tokio_tungstenite::Connector::Rustls(
+                        tls::insecure_client_config(),
+                    ))
+                } else {
+                    None
+                };
+
+                let ws_stream = match tokio_tungstenite::connect_async_tls_with_config(
+                    &url, None, false, connector,
+                )
+                .await
+                {
                     Ok((ws, _)) => ws,
                     Err(_) => {
                         tokio::time::sleep(current_interval).await;
@@ -251,16 +320,38 @@ impl WsClientPool {
                     }
                 };
 
+                // Extract peer certificate fingerprint before bridging
+                let peer_fp = if self.tls_code != "0" {
+                    match ws_stream.get_ref() {
+                        tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => {
+                            let (_, session) = tls_stream.get_ref();
+                            session
+                                .peer_certificates()
+                                .and_then(|certs| certs.first())
+                                .map(|cert| tls::format_cert_fingerprint(cert.as_ref()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 let id = format!("{:08x}", id_counter);
                 id_counter += 1;
 
-                let conn: PoolConn = Box::pin(WsAdapter::new_client(ws_stream));
+                let conn: PoolConn = Box::pin(spawn_ws_bridge(ws_stream));
 
                 {
                     let mut conns = self.connections.lock().await;
-                    conns.push((id, conn));
+                    conns.push((id.clone(), conn));
                     self.active.fetch_add(1, Ordering::SeqCst);
                     self.conn_notify.notify_one();
+                }
+
+                // Store fingerprint if available
+                if let Some(fp) = peer_fp {
+                    let mut fps = self.fingerprints.lock().await;
+                    fps.insert(id, fp);
                 }
 
                 if !self.ready.load(Ordering::SeqCst) {
@@ -326,7 +417,9 @@ impl TransportPool for WsClientPool {
 
     async fn flush(&self) {
         let mut conns = self.connections.lock().await;
+        let mut fps = self.fingerprints.lock().await;
         conns.clear();
+        fps.clear();
         self.active.store(0, Ordering::SeqCst);
     }
     async fn close(&self) {
@@ -340,66 +433,8 @@ impl TransportPool for WsClientPool {
     fn add_error(&self) { self.errors.fetch_add(1, Ordering::SeqCst); }
     fn error_count(&self) -> usize { self.errors.load(Ordering::SeqCst) }
     fn reset_error(&self) { self.errors.store(0, Ordering::SeqCst); }
-}
 
-/// Adapter that wraps a WebSocket stream into AsyncRead + AsyncWrite
-struct WsAdapter<S> {
-    rx_buf: Vec<u8>,
-    rx_pos: usize,
-    ws: Arc<tokio::sync::Mutex<S>>,
-}
-
-impl WsAdapter<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>> {
-    fn new_server(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Self {
-        Self {
-            rx_buf: Vec::new(),
-            rx_pos: 0,
-            ws: Arc::new(tokio::sync::Mutex::new(ws)),
-        }
-    }
-}
-
-impl WsAdapter<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
-    fn new_client(ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Self {
-        Self {
-            rx_buf: Vec::new(),
-            rx_pos: 0,
-            ws: Arc::new(tokio::sync::Mutex::new(ws)),
-        }
-    }
-}
-
-// Note: Full AsyncRead/AsyncWrite implementation for WebSocket adapter is complex.
-// For compilation, we provide stub implementations. A production version would
-// properly bridge WebSocket message framing to byte stream semantics.
-impl<S: Unpin + Send> Unpin for WsAdapter<S> {}
-
-impl<S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static> AsyncRead for WsAdapter<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Simplified: In production, poll the WebSocket stream for messages
-        Poll::Pending
-    }
-}
-
-impl<S: SinkExt<Message> + Unpin + Send + 'static> AsyncWrite for WsAdapter<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        // Simplified: In production, send binary messages
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn fingerprint_for(&self, id: &str) -> Option<String> {
+        self.fingerprints.try_lock().ok()?.get(id).cloned()
     }
 }
